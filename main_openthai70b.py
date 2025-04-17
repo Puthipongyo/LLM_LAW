@@ -22,24 +22,25 @@ quant_config = BitsAndBytesConfig(
     bnb_4bit_quant_type="nf4"
 )
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, use_auth_token=True)
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     quantization_config=quant_config,
     device_map="auto",
-    torch_dtype=torch.float16
+    torch_dtype=torch.float16,
+    use_auth_token=True
 )
 
 # 3. Prepare chat prompt (ตาม chat template ของ OpenThaiGPT)
-messages = [
-    {"role": "user", "content": f"""จากข้อความใน PDF ต่อไปนี้:
+prompt = f"""<|user|>
+จากข้อความใน PDF ต่อไปนี้:
 
 \"\"\"{page_text}\"\"\"
 
-คำถาม: ข้อความที่ให้ไปในมาตรา ๖ มีมาตราอะไรมาเกี่ยวข้องด้วย?"""}
-]
+คำถาม: ข้อความที่ให้ไปในมาตรา ๖ มีมาตราอะไรมาเกี่ยวข้องด้วย?
+<|assistant|>
+"""
 
-prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 # 4. Tokenize & send to GPU
 inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
