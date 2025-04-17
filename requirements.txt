@@ -4,3 +4,5 @@ accelerate
 sentencepiece
 PyMuPDF
 bitsandbytes
+PyPT
+pandas
