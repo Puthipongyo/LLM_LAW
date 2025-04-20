@@ -1,16 +1,18 @@
 import os
+import re
 import torch
 import pandas as pd
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from huggingface_hub import HfFolder
+import pytrec_eval
 
-# ตั้งค่าป้องกัน CUDA memory fragmentation
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.cuda.empty_cache()
 
-# 1. Load model & tokenizer
+
 model_name = "scb10x/llama3.1-typhoon2-70b-instruct"
-token = HfFolder.get_token()  # ใช้ token ที่ login ไว้ในเครื่องนี้
+token = HfFolder.get_token()
 
 quant_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -28,11 +30,17 @@ model = AutoModelForCausalLM.from_pretrained(
     token=token
 )
 
-# 2. ฟังก์ชันถามคำถามจาก context
-def ask_law_question(question, context, return_text=False):
+# ฟังก์ชันถามคำถามกฎหมาย
+def ask_law_question(question, context):
     messages = [
-        {"role": "system", "content": "คุณคือนักกฎหมายผู้เชี่ยวชาญกฏหมายแพ่งและพาณิชย์ หน้าที่ของคุณคือรับสถานการณ์จาก user prompt และตอบเฉพาะเลขมาตรากฎหมายแพ่งและพาณิชย์ 5 อันดับที่เกี่ยวข้องที่สุดเท่านั้น"},
-        {"role": "user", "content": f"บริบท:\n{context}\n\nคำถาม:\n{question}"},
+        {"role": "system", "content": """ 
+        คุณคือนักกฎหมายผู้เชี่ยวชาญกฎหมายแพ่งและพาณิชย์
+        จงอ่านข้อความคดีต่อไปนี้อย่างละเอียด แล้วตอบเฉพาะ "เลขมาตรากฎหมายแพ่งและพาณิชย์" ที่เกี่ยวข้องมากที่สุด 5 มาตราแรก ที่งเกี่ยวข้องโดยตรงเเละโดยอ้อม โดยเรียงตามลำดับความเกี่ยวข้องมากไปน้อย ห้ามเกิน 5 มาตรา และไม่ต้องมีคำว่า "มาตรา"
+        ให้ตอบเป็นเลขคั่นด้วยเครื่องหมายจุลภาค เช่น: 1336, 1299, 1520, 1500, 1337
+        """},
+        {"role": "user", "content": f"""
+        บริบท:\n{context}\n\nคำถาม:\n{question}
+        """},
     ]
 
     input_ids = tokenizer.apply_chat_template(
@@ -48,9 +56,9 @@ def ask_law_question(question, context, return_text=False):
 
     outputs = model.generate(
         input_ids,
-        max_new_tokens=512,
+        max_new_tokens=256,
         eos_token_id=terminators,
-        do_sample=True,
+        do_sample=False,
         temperature=0.7,
         top_p=0.95,
     )
@@ -59,36 +67,67 @@ def ask_law_question(question, context, return_text=False):
 
     return decoded.strip()
 
+# ฟังก์ชันแยกเฉพาะเลขมาตรา เช่น 1336
+def extract_law_numbers(text):
+    return re.findall(r'\d+', text)
 
-# 3. Main process
+def evaluate_with_pytrec(df, k=5):
+    qrel = {}  # ground truth
+    run = {}   # predicted
+
+    for idx, row in df.iterrows():
+        qid = f"q{idx}"
+        true_ids = extract_law_numbers(str(row['answers']))
+        pred_ids = extract_law_numbers(str(row['predicted_law']))[:k]
+
+        qrel[qid] = {law_id: 1 for law_id in true_ids}
+
+        run[qid] = {law_id: 1.0 / (i + 1) for i, law_id in enumerate(pred_ids)}
+
+    evaluator = pytrec_eval.RelevanceEvaluator(qrel, {'recall'})
+    results = evaluator.evaluate(run)
+
+
+    per_row_recalls = []
+    for qid, metrics in results.items():
+        row_idx = int(qid[1:])
+        recall_score = metrics.get(f'recall_{k}', 0.0)
+        df.at[row_idx, 'recall_at_k'] = recall_score
+        per_row_recalls.append(recall_score)
+
+    average_recall = sum(per_row_recalls) / len(per_row_recalls) if per_row_recalls else 0.0
+    return average_recall
+
+# Main process
 if __name__ == "__main__":
     df = pd.read_csv("/workspace/test/data_case_100.csv", encoding="utf-8-sig")
 
-    if "text" not in df.columns:
-        raise ValueError("ไม่พบ column 'text' ในไฟล์ CSV")
+    if "text" not in df.columns or "answers" not in df.columns:
+        raise ValueError("CSV ต้องมี column 'text' และ 'answers'")
 
-    # เตรียมคอลัมน์ผลลัพธ์
     df['predicted_law'] = ""
 
-    # วนลูปรันแต่ละแถว
     for i in range(df.shape[0]):
-        question = df['text'].iloc[i]
-
-        # context อาจใช้จากก่อนหน้า หรือเฉพาะแถวนี้ก็ได้
-        context = f"{question}"
+        context = df['text'].iloc[i]
+        # context = f"{question}"
 
         full_prompt = f"""
-        {question}
-
-        ข้อความคดีนี้มีมาตราแพ่งและพาณิชย์ที่เกี่ยวข้องมากที่สุด 5 อันดับแรก มีอะไรบ้าง (บอกแค่มาตรา)
+        ข้อความคดีนี้มีมาตราแพ่งและพาณิชย์ที่เกี่ยวข้องมากที่สุด 5 อันดับแรก มีอะไรบ้าง 
         """.strip()
 
         ans = ask_law_question(full_prompt, context)
         df.at[i, 'predicted_law'] = ans
         print(f"[{i}] ✅ Answer: {ans}")
 
-        if i == 2:  # ทดสอบแค่ 3 แถวแรก
+        if i == 50:  # ทดสอบแค่ 3 แถวแรก
             break
 
+    # ประเมิน Recall@5
+    df_eval = df.head(50)
+    recall_k = evaluate_with_pytrec(df_eval, k=5)
+
+
+    print(f"\n🎯 Recall@5 (เฉลี่ยจาก {len(df_eval)} แถว): {recall_k:.4f}")
+
     # บันทึกผล
-    df.head(3).to_csv("/workspace/test/output_predicted.csv", index=False, encoding="utf-8-sig")
+    df_eval.to_csv("/workspace/test/output_predicted.csv", index=False, encoding="utf-8-sig")
